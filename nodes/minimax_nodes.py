@@ -20,25 +20,43 @@ except Exception:
 
 def minimax_mlp_chunked_forward(self, x):
     # x is packed (S, hidden); rows are independent and int8 activation quant is per-row, so token chunking is exact
-    if x.shape[0] > self.kj_seq_threshold and self.kj_num_chunks > 1:
-        out = torch.empty_like(x)
-        offset = 0
-        for c in torch.chunk(x, self.kj_num_chunks, dim=0):
-            out[offset:offset + c.shape[0]] = comfy.ops.linear_input_act(self.fc2, self.fc1(c), "swiglu")
-            offset += c.shape[0]
-        return out
-    return comfy.ops.linear_input_act(self.fc2, self.fc1(x), "swiglu")
+    if self.kj_existing_forward:
+        def actuator(v):
+            return self.kj_existing_forward(v)
+    else:
+        def actuator(v):
+            return comfy.ops.linear_input_act(self.fc2, self.fc1(v), "swiglu")
+
+    if x.shape[0] <= self.kj_seq_threshold or self.kj_num_chunks <= 1:
+        return actuator(x)
+    
+    chunks = torch.chunk(x, self.kj_num_chunks, dim=0)
+    first = actuator(chunks[0])
+    out = torch.empty(
+        x.shape[0], first.shape[1],
+        dtype=first.dtype, device=x.device
+    )
+    out[0:first.shape[0]] = first
+
+    offset = first.shape[0]
+    for c in chunks[1:]:
+        out[offset:offset + c.shape[0]] = actuator(c)
+        offset += c.shape[0]
+
+    return out
 
 
 class MiniMaxFFNChunkPatch:
-    def __init__(self, num_chunks, seq_threshold):
+    def __init__(self, num_chunks, seq_threshold, existing_forward):
         self.num_chunks = num_chunks
         self.seq_threshold = seq_threshold
+        self.existing_forward = existing_forward
 
     def __get__(self, obj, objtype=None):
         def wrapped_forward(self_module, *args, **kwargs):
             self_module.kj_num_chunks = self.num_chunks
             self_module.kj_seq_threshold = self.seq_threshold
+            self_module.kj_existing_forward = self.existing_forward
             return minimax_mlp_chunked_forward(self_module, *args, **kwargs)
         return types.MethodType(wrapped_forward, obj)
 
@@ -80,7 +98,8 @@ class MiniMaxChunkFeedForward(io.ComfyNode):
             return io.NodeOutput(model)
 
         for idx, block in enumerate(blocks):
-            patched = MiniMaxFFNChunkPatch(chunks, seq_threshold).__get__(block.mlp, block.mlp.__class__)
+            existing_forward = m.object_patches.get(f"diffusion_model.blocks.{idx}.mlp.forward")
+            patched = MiniMaxFFNChunkPatch(chunks, seq_threshold, existing_forward).__get__(block.mlp, block.mlp.__class__)
             m.add_object_patch(f"diffusion_model.blocks.{idx}.mlp.forward", patched)
 
         return io.NodeOutput(m)
