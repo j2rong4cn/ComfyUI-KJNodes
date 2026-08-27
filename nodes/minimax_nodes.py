@@ -159,11 +159,24 @@ minimax_attn_lowmem_forward._uses_optimized_attention = True
 
 def minimax_block_lowmem_forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}):
     # DiTBlock.forward, but hands h to attn in a list so attn can free it after the qkv GEMM
+    star7_fp16 = bool(transformer_options.get("star7_minimax_h3_fp16_exact_fix")) and x.dtype == torch.float16
+    if star7_fp16:
+        x = x.to(torch.float32)
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
     h = [_mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)]
-    x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
+    if star7_fp16:
+        h[0] = h[0].to(torch.float16)
+    attn_out = self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options)
+    if star7_fp16:
+        attn_out = attn_out.to(torch.float32)
+    x = _mod_gate(x, gate_msa, attn_out, mod_segments)
     h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
-    return _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
+    if star7_fp16:
+        h = h.to(torch.float16)
+    mlp_out = self.mlp(h)
+    if star7_fp16:
+        mlp_out = mlp_out.to(torch.float32)
+    return _mod_gate(x, gate_mlp, mlp_out, mod_segments)
 
 
 class MiniMaxLowVRAMAttention(io.ComfyNode):
